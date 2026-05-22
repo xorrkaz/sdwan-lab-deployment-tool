@@ -37,6 +37,189 @@ from .utils import (
     wait_for_wan_edge_onboaring,
 )
 
+SDWAN_NODE_DEFINITIONS = [
+    "cat-sdwan-manager",
+    "cat-sdwan-validator",
+    "cat-sdwan-controller",
+    "cat-sdwan-edge",
+]
+WIPED_NODE_STATES = ["DEFINED_ON_CORE"]
+
+
+def _lab_notes(manager_ip: str, manager_port: int) -> str:
+    return (
+        f"-- Do not delete this text --\n"
+        f"manager_external_ip = {manager_ip}:{manager_port}\n"
+        f"-- Do not delete this text --"
+    )
+
+
+def _find_lab_by_name(cml: Any, lab_name: str) -> Any:
+    labs = cml.find_labs_by_title(lab_name)
+    if not labs:
+        sys.exit(f'Could not find a lab with name "{lab_name}".')
+    if len(labs) > 1:
+        sys.exit(
+            f'There are multiple labs/topologies with name "{lab_name}". Please make sure '
+            f"lab names are unique and rerun the restore task."
+        )
+    return labs[0]
+
+
+def _update_existing_lab_notes(lab: Any, notes: str, log: Any) -> None:
+    try:
+        lab.notes = notes
+    except Exception as exc:
+        log.warning(f"Could not update existing lab notes: {exc}")
+
+
+def _replace_node_tags(node: Any, desired_tags: List[str]) -> None:
+    desired_tags = desired_tags or []
+    tags_attr = getattr(node, "tags", [])
+    current_tags = tags_attr() if callable(tags_attr) else tags_attr
+    current_tags = current_tags or []
+    for tag in set(current_tags) - set(desired_tags):
+        node.remove_tag(tag)
+    for tag in desired_tags:
+        if tag not in current_tags:
+            node.add_tag(tag)
+
+
+def _node_key(node: Any) -> tuple[str, str]:
+    return (node.node_definition, node.label)
+
+
+def _backup_node_key(node: Dict[str, Any]) -> tuple[str, str]:
+    return (node["node_definition"], node["label"])
+
+
+def _node_is_wiped(node: Any) -> bool:
+    return node.state in WIPED_NODE_STATES
+
+
+def _backup_node_has_sdwan_day0(node: Dict[str, Any]) -> bool:
+    configuration = node.get("configuration") or ""
+    return (
+        "vinitparam:" in configuration
+        and re.search(r"\buuid\s*:", configuration) is not None
+        and re.search(r"\b(vbond|SD-Routing)\b", configuration) is not None
+    )
+
+
+def _backup_node_is_sdwan_edge(node: Dict[str, Any]) -> bool:
+    if node["node_definition"] == "cat-sdwan-edge":
+        return True
+    if node["node_definition"] == "cat8000v":
+        return _backup_node_has_sdwan_day0(node)
+    return False
+
+
+def _backup_node_is_sdwan(node: Dict[str, Any]) -> bool:
+    if node["node_definition"] in [
+        "cat-sdwan-manager",
+        "cat-sdwan-validator",
+        "cat-sdwan-controller",
+    ]:
+        return True
+    return _backup_node_is_sdwan_edge(node)
+
+
+def _get_backup_sdwan_nodes(cml_topology_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        node
+        for node in cml_topology_dict["nodes"]
+        if _backup_node_is_sdwan(node)
+    ]
+
+
+def _get_backup_sdwan_edge_nodes(
+    cml_topology_dict: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    return [
+        node
+        for node in cml_topology_dict["nodes"]
+        if _backup_node_is_sdwan_edge(node)
+    ]
+
+
+def _get_backup_sdwan_edge_keys(
+    cml_topology_dict: Dict[str, Any]
+) -> set[tuple[str, str]]:
+    return {
+        _backup_node_key(node)
+        for node in _get_backup_sdwan_edge_nodes(cml_topology_dict)
+    }
+
+
+def _update_existing_lab_sdwan_nodes(
+    lab: Any, cml_topology_dict: Dict[str, Any], log: Any
+) -> None:
+    track_progress(log, "Updating SD-WAN node configuration in existing lab...")
+    backup_nodes = _get_backup_sdwan_nodes(cml_topology_dict)
+    backup_node_keys = {_backup_node_key(node) for node in backup_nodes}
+    existing_nodes = {
+        _node_key(node): node
+        for node in lab.nodes()
+        if node.node_definition in SDWAN_NODE_DEFINITIONS
+        or _node_key(node) in backup_node_keys
+    }
+    missing_nodes = []
+    not_wiped_nodes = []
+    extra_nodes = [
+        f"{node.label} ({node.node_definition})"
+        for node_key, node in existing_nodes.items()
+        if node_key not in backup_node_keys
+    ]
+    for backup_node in backup_nodes:
+        node_key = _backup_node_key(backup_node)
+        existing_node = existing_nodes.get(node_key)
+        if not existing_node:
+            missing_nodes.append(
+                f'{backup_node["label"]} ({backup_node["node_definition"]})'
+            )
+        elif not _node_is_wiped(existing_node):
+            not_wiped_nodes.append(f"{existing_node.label} ({existing_node.state})")
+    if missing_nodes:
+        sys.exit(
+            "The existing lab is missing SD-WAN nodes from the backup: "
+            f"{', '.join(missing_nodes)}. Existing lab restore matches nodes by "
+            "label and node definition."
+        )
+    if extra_nodes:
+        sys.exit(
+            "The existing lab has SD-WAN nodes that are not present in the backup: "
+            f"{', '.join(extra_nodes)}. Remove them or restore into a lab that "
+            "matches the backed-up SD-WAN node set."
+        )
+    if not_wiped_nodes:
+        sys.exit(
+            "Existing lab restore needs SD-WAN nodes to be wiped before day0 "
+            "configuration can be applied. Wipe these nodes first: "
+            f"{', '.join(not_wiped_nodes)}"
+        )
+
+    for backup_node in backup_nodes:
+        node_key = _backup_node_key(backup_node)
+        existing_node = existing_nodes[node_key]
+        if backup_node.get("image_definition") and (
+            existing_node.image_definition != backup_node["image_definition"]
+        ):
+            try:
+                existing_node.image_definition = backup_node["image_definition"]
+            except Exception as exc:
+                sys.exit(
+                    f'Could not update image definition for node "{existing_node.label}" '
+                    f'to "{backup_node["image_definition"]}": {exc}'
+                )
+        existing_node.configuration = backup_node.get("configuration", "")
+        if "tags" in backup_node:
+            try:
+                _replace_node_tags(existing_node, backup_node["tags"])
+            except Exception as exc:
+                sys.exit(
+                    f'Could not update tags for node "{existing_node.label}": {exc}'
+                )
+
 
 def main(
     cml_config: ClientConfig,
@@ -54,6 +237,7 @@ def main(
     loglevel: Union[int, str],
     contr_version: str,
     edge_version: str,
+    existing_lab: bool = False,
 ) -> None:
     # Time the script execution
     begin_time = datetime.datetime.now()
@@ -71,6 +255,8 @@ def main(
     # create cml instance and check version
     cml = cml_config.make_client()
     verify_cml_version(cml)
+    if existing_lab and deleteexisting:
+        sys.exit("--existing-lab cannot be used together with --deleteexisting.")
 
     # Setup YAML
     yaml = YAML(typ="rt")
@@ -104,11 +290,21 @@ def main(
     if edge_version:
         # Check if the software version requested by user is compatible with the backup
         # In particular, check if the requested version is not older than the backup version
-        backup_version = next(
-            node["image_definition"].split("-")[-1]
-            for node in cml_topology_dict["nodes"]
-            if node["node_definition"] == "cat-sdwan-edge"
-        )
+        backup_edge_nodes = _get_backup_sdwan_edge_nodes(cml_topology_dict)
+        if not backup_edge_nodes:
+            sys.exit("No SD-WAN Edge nodes found in the backup.")
+        unsupported_edge_version_nodes = [
+            node["label"]
+            for node in backup_edge_nodes
+            if node["node_definition"] != "cat-sdwan-edge"
+        ]
+        if unsupported_edge_version_nodes:
+            sys.exit(
+                "--edge_version is only supported for cat-sdwan-edge nodes. "
+                "Cannot change the image version for backup-driven Cat8Kv SD-WAN "
+                f"nodes: {', '.join(unsupported_edge_version_nodes)}"
+            )
+        backup_version = backup_edge_nodes[0]["image_definition"].split("-")[-1]
         backup_version_split = backup_version.split(".")
         edge_version_split = edge_version.split(".")
         if int(edge_version_split[0]) < int(backup_version_split[0]) or (
@@ -171,7 +367,7 @@ def main(
         )
 
     if deleteexisting:
-        track_progress(log, "Checking for exiting lab...")
+        track_progress(log, "Checking for existing lab...")
         # If deleteexisting is set, check if there's existing lab with same name and SD-WAN Manager IP.
         lab = next(
             (
@@ -196,24 +392,26 @@ def main(
     if retry:
         # If retry flag is set, skip the lab bringup and move directly to SD-WAN Manager steps
         track_progress(log, "Retry flag set, checking if lab already exists in CML...")
-        manager_details = f"{manager_ip}:{manager_port}" if patty_used else manager_ip
-        labs = [lab for lab in cml.all_labs(show_all=True)]
-        lab = next((lab for lab in labs if manager_details in lab.notes), None)
-        if not lab:
-            exit(
-                "\nRetry option is set, but script cloud not find the "
-                "lab with specified SD-WAN Manager IP."
+        if existing_lab:
+            lab = _find_lab_by_name(cml, lab_name)
+        else:
+            manager_details = (
+                f"{manager_ip}:{manager_port}" if patty_used else manager_ip
             )
+            labs = [lab for lab in cml.all_labs(show_all=True)]
+            lab = next((lab for lab in labs if manager_details in lab.notes), None)
+            if not lab:
+                exit(
+                    "\nRetry option is set, but script cloud not find the "
+                    "lab with specified SD-WAN Manager IP."
+                )
     else:
         track_progress(log, "Updating lab parameters...")
         if not patty_used:
             # Check if the IP allocated for SD-WAN Manager is not already it use.
             check_manager_ip_is_free(manager_ip)
         # Update SD-WAN Manager IP in lab title and description
-        cml_topology_dict["lab"]["notes"] = (
-            f"-- Do not delete this text --\nmanager_external_ip = {manager_ip}:{manager_port}\n-- "
-            f"Do not delete this text --"
-        )
+        cml_topology_dict["lab"]["notes"] = _lab_notes(manager_ip, manager_port)
         cml_topology_dict["lab"]["title"] = lab_name
         # Update SD-WAN Manager cloud-init config with password
         encrypted_manager_password = sha512_crypt.encrypt(manager_password, rounds=5000)
@@ -314,14 +512,20 @@ def main(
                     node["image_definition"] = (
                         f'{node["node_definition"]}-{edge_version}'
                     )
-        stream = io.StringIO()
-        yaml.dump(cml_topology_dict, stream)
-        track_progress(log, "Importing the lab...")
-        lab = cml.import_lab(stream.getvalue())
+        if existing_lab:
+            lab = _find_lab_by_name(cml, lab_name)
+            _update_existing_lab_notes(lab, cml_topology_dict["lab"]["notes"], log)
+            _update_existing_lab_sdwan_nodes(lab, cml_topology_dict, log)
+        else:
+            stream = io.StringIO()
+            yaml.dump(cml_topology_dict, stream)
+            track_progress(log, "Importing the lab...")
+            lab = cml.import_lab(stream.getvalue())
 
     # Define lists that will hold Validators and Controllers VPN0 IPs
     control_components = {}
     device_ip_to_system_ip = {}
+    sdwan_edge_node_keys = _get_backup_sdwan_edge_keys(cml_topology_dict)
     serial_file_version = None
     manager_node = None
     config_version = 2
@@ -364,7 +568,13 @@ def main(
                 control_components[vpn0_ip] = "validator"
             log.info(f"Starting node {node.label}...")
             node.start()
-        elif node.node_definition == "cat8000v" and node.is_booted() is False:
+        elif _node_key(node) in sdwan_edge_node_keys:
+            continue
+        elif (
+            node.node_definition == "cat8000v"
+            and not existing_lab
+            and node.is_booted() is False
+        ):
             # To workaround CML problem, after config export for this node
             # we need to add 'no shutdown' under all interfaces
             node.configuration = re.sub(
@@ -377,6 +587,9 @@ def main(
             # Start all the nodes except WAN Edges
             log.info(f"Starting node {node.label}...")
             node.start()
+
+    if manager_node is None:
+        sys.exit("No SD-WAN Manager node found in the lab.")
 
     track_progress(log, "Waiting for SD-WAN Manager to boot...")
     manager_node.wait_until_converged()
@@ -548,7 +761,7 @@ def main(
     }
     wan_edges_to_onboard = []
     for node in lab.nodes():
-        if node.node_definition == "cat-sdwan-edge" and node.is_booted() is False:
+        if _node_key(node) in sdwan_edge_node_keys and node.is_booted() is False:
             # Before we boot Edge we need to update the cloud-init OTP token
             uuid_search = re.search(
                 r"vinitparam:[\w\W]+?uuid\s:\s([\w-]+)", node.configuration

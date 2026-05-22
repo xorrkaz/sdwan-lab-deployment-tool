@@ -470,6 +470,12 @@ def cli_backup(
     help="Change the SD-WAN/SD-Routing edge version when restoring the lab. Note the specified "
     "version cannot be older than the one used in the backup.",
 )
+@click.option(
+    "--existing-lab",
+    is_flag=True,
+    default=False,
+    help="Restore into the existing CML lab named by --lab instead of importing a new lab.",
+)
 @click.pass_context
 def cli_restore(
     ctx: click.Context,
@@ -484,10 +490,15 @@ def cli_restore(
     retry: bool,
     contr_version: str,
     edge_version: str,
+    existing_lab: bool,
 ) -> None:
     cml_config = ctx.obj["CML_CONFIG"]
     cml_ip = cml_config.url
     patty_used, manager_ip, manager_port = set_manager_details(cml_ip, manager)
+    if existing_lab and deleteexisting:
+        raise click.UsageError(
+            "--existing-lab cannot be used together with --deleteexisting."
+        )
 
     if not patty_used and not mgateway:
         mmask = click.prompt("SD-WAN Manager subnet mask (e.g. /24)")
@@ -512,6 +523,7 @@ def cli_restore(
         loglevel,
         contr_version,
         edge_version,
+        existing_lab,
     )
 
 

@@ -350,7 +350,7 @@ This task restores Catalyst SD-WAN lab from a backup. This task will:
 3. Restore SD-WAN Manager templates, policies and configuration groups using [Sastre](https://github.com/CiscoDevNet/sastre).
 4. Verify if there are any WAN Edges in the topology (SD-WAN and SD-Routing). If yes, then generate the new OTP and automatically reonboard them to SD-WAN Manager.
 
-This task has several task-specific parameters, including working directory from where backup is restored. You can also overwrite the software version for control components and SD-WAN/SD-Routing Edges (note that specifying version lower than the one in the backup is not supported).
+This task has several task-specific parameters, including working directory from where backup is restored. You can also overwrite the software version for control components and SD-WAN/SD-Routing Edges (note that specifying version lower than the one in the backup is not supported). If you already imported a copy of the topology into CML, use `--existing-lab` to restore into that lab instead of creating a new lab. In this mode, SD-WAN nodes are matched by label and node definition, receive the backed-up day0 configuration before boot, and then follow the normal restore workflow. The target lab must have the same SD-WAN node set as the backup, and those SD-WAN nodes must be wiped, meaning they have no existing runtime state. In CML this appears as `DEFINED_ON_CORE`. Non-SD-WAN nodes, links, and their imported configurations are left intact. A Cat8Kv is restored as an SD-WAN Edge only when the backup identifies it with SD-WAN day0 data; otherwise it is treated like any other non-SD-WAN node.
 
       sdwan-lab restore -h
 
@@ -378,6 +378,8 @@ This task has several task-specific parameters, including working directory from
       │                                           onboarding the lab that is already in CML               │
       │ --contr_version       <contr_version>     Change the controller version when restoring the lab.   │
       │ --edge_version        <edge_version>      Change the SD-WAN edge version when restoring the lab.  │
+      │ --existing-lab                            Restore into the existing CML lab named by --lab        │
+      │                                           instead of importing a new lab.                          │
       │ --help            -h                      Show this message and exit.                             │
       ╰───────────────────────────────────────────────────────────────────────────────────────────────────╯
 
@@ -387,6 +389,7 @@ Below you will find few examples of restore task:
     sdwan-lab restore --workdir backup --deleteexisting
     sdwan-lab restore --workdir backup --contr_version 20.16.1
     sdwan-lab restore --workdir backup --contr_version 20.16.1 --edge_version 17.16.01a
+    sdwan-lab restore --workdir backup --lab cloned-lab --existing-lab
 
 ### Delete Task
 
